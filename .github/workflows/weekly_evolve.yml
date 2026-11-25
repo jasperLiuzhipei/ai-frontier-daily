@@ -1,0 +1,132 @@
+name: AI Daily Weekly Evolution & Model Check
+
+on:
+  schedule:
+    # 北京时间每周日 15:30 独立运行（完全脱离每日发送关键路径，仅产出提案不直接改写线上配置）
+    - cron: "30 7 * * 0"
+  workflow_dispatch:
+    inputs:
+      no_llm:
+        description: "Run rule-only evolution proposal without calling LLM"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ai-daily-evolve
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  evolve-proposal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TZ: Asia/Shanghai
+      AI_DAILY_TZ: Asia/Shanghai
+      PYTHONPATH: src
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v4
+
+      - name: Check required secrets configured
+        id: check_secrets
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -n "$DEEPSEEK_API_KEY" ] || [ -n "$LLM_API_KEY" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.no_llm }}" = "true" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No LLM API key Secret configured; skipping weekly evolution cleanly."
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### ⏭️ 已跳过周度自演进（未配置 LLM API Key Secret）"
+                echo ""
+                echo "配置 \`DEEPSEEK_API_KEY\` 或 \`LLM_API_KEY\` 后自动生效；也可手动触发并勾选 \`no_llm\` 运行纯规则提案。"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+      - name: Set up Python 3.12
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore SQLite telemetry cache
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: data/state.db
+          key: ai-daily-state-
+          restore-keys: |
+            ai-daily-state-
+
+      - name: Probe newer LLM models (proposal only, no auto-apply)
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: |
+          if [ "${{ inputs.no_llm }}" != "true" ]; then
+            python3 -m ai_daily models sync > /tmp/model_sync.json || true
+          fi
+
+      - name: Generate self-evolution proposal (proposal only, never mutates config/)
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.no_llm }}" = "true" ]; then
+            ARGS="--no-llm"
+          fi
+          python3 -m ai_daily evolve $ARGS > /tmp/evolution_proposal.json
+
+      - name: Upload evolution proposals as artifact
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: evolution-proposals-${{ github.run_id }}
+          path: |
+            data/evolution_proposals.json
+            data/model_registry.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Summarize proposals in Job Summary
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if not summary_file:
+              raise SystemExit(0)
+          lines = ["### 🧬 周度自演进与模型探测提案（仅提案，未自动改动线上配置）", ""]
+          reg_p = pathlib.Path("data/model_registry.json")
+          if reg_p.is_file():
+              reg = json.loads(reg_p.read_text(encoding="utf-8"))
+              lines.append(f"- **当前主模型**: `{reg.get('current_primary')}` | **建议升级**: `{reg.get('recommended_upgrade') or '无'}`")
+          prop_p = pathlib.Path("data/evolution_proposals.json")
+          if prop_p.is_file():
+              prop = json.loads(prop_p.read_text(encoding="utf-8"))
+              lines.append(f"- **提案摘要**: {prop.get('summary', '')}")
+              lines.append(f"- **建议新增赛道词**: {len(prop.get('add_keywords') or [])} 条")
+              lines.append(f"- **建议新增重点词/屏蔽词**: +{len(prop.get('add_boost_keywords') or [])} / -{len(prop.get('add_exclude_keywords') or [])}")
+              lines.append(f"- **信源权重/停用建议**: {len(prop.get('source_adjustments') or [])} 条")
+              lines.append("")
+              lines.append("审核无误后可在本地执行 `python3 run.py evolve --apply` 或 `python3 run.py models sync --apply` 落库。")
+          with open(summary_file, "a", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+          PY

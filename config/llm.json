@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "provider": "openai_compatible",
+  "base_url": "https://api.deepseek.com/v1",
+  "api_key_env": [
+    "LLM_API_KEY",
+    "DEEPSEEK_API_KEY"
+  ],
+  "primary_model": "deepseek-flash",
+  "fallback_models": [
+    "deepseek-v4-pro"
+  ],
+  "temperature": 0.2,
+  "max_tokens": 16384,
+  "extra_body": {
+    "reasoning_effort": "low"
+  },
+  "timeout_seconds": 120,
+  "max_retries": 2,
+  "auto_iteration": {
+    "enabled": true,
+    "auto_discover_on_error": true,
+    "auto_upgrade_primary": false,
+    "family_patterns": [
+      "deepseek.*flash",
+      "deepseek-v\\d",
+      "deepseek-pro"
+    ],
+    "exclude_patterns": [
+      "embed",
+      "rerank",
+      "tts",
+      "whisper",
+      "asr",
+      "ocr",
+      "moderation",
+      "legacy"
+    ],
+    "probe_prompt": "Reply with exactly: OK",
+    "max_probe_candidates": 3
+  }
+}

@@ -1,0 +1,22 @@
+# Secrets & local env
+.env
+.env.local
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Runtime DB, local delivery state & logs (keep config/ and history/)
+data/state.db
+data/state.db-journal
+data/state.db-wal
+data/state.db-shm
+data/delivery/
+.delivery-state/
+output/*.v1.md
+*.log
+.DS_Store

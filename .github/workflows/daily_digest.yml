@@ -1,0 +1,280 @@
+name: AI Frontier Daily Digest
+
+on:
+  schedule:
+    # 北京时间 10:23 主跑（避开 :00/:30 队列高峰；若主备模型全挂则报错交由 10:47 重试）
+    - cron: "23 2 * * *"
+    # 北京时间 10:47 兜底补跑（检查 delivery-state 回执：已送达自动跳过，有待发稿直接复用补发，模型仍全挂则发降级短报）
+    - cron: "47 2 * * *"
+  repository_dispatch:
+    types: [daily-digest]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (skip push & state mutation)"
+        required: false
+        default: false
+        type: boolean
+      force:
+        description: "Force regenerate & resend even if today is already delivered"
+        required: false
+        default: false
+        type: boolean
+      allow_degrade:
+        description: "Allow rule-based degraded short digest if all LLM models fail"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ai-daily-digest
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  daily-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Shanghai
+      AI_DAILY_TZ: Asia/Shanghai
+      PYTHONPATH: src
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v4
+
+      - name: Check required secrets configured
+        id: check_secrets
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          HAS_LLM="false"
+          if [ -n "$DEEPSEEK_API_KEY" ] || [ -n "$LLM_API_KEY" ]; then
+            HAS_LLM="true"
+          fi
+          HAS_FEISHU="false"
+          if ([ -n "$FEISHU_APP_ID" ] && [ -n "$FEISHU_APP_SECRET" ] && [ -n "$FEISHU_CHAT_ID" ]) || [ -n "$FEISHU_WEBHOOK_URL" ]; then
+            HAS_FEISHU="true"
+          fi
+
+          if [ "${{ inputs.dry_run }}" = "true" ] && [ "$HAS_LLM" = "true" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HAS_LLM" = "true" ] && [ "$HAS_FEISHU" = "true" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Required Secrets (DEEPSEEK_API_KEY/LLM_API_KEY and Feishu credentials) are not configured; skipping run cleanly."
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### ⏭️ 已跳过本次运行（未配置必需 Secrets）"
+                echo ""
+                echo "检测到仓库尚未配置完整 Secrets（需要 \`DEEPSEEK_API_KEY\` 或 \`LLM_API_KEY\`，以及飞书凭证 \`FEISHU_APP_ID/SECRET/CHAT_ID\` 或 \`FEISHU_WEBHOOK_URL\`）。"
+                echo "如需启用自动日报推送，请在 \`Settings → Secrets and variables → Actions\` 中完成配置。"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+      - name: Set up Python 3.12
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync delivery-state branch
+        if: ${{ steps.check_secrets.outputs.ready == 'true' && inputs.dry_run != true }}
+        run: bash scripts/sync_state_branch.sh pull delivery-state .delivery-state
+
+      - name: Restore SQLite dedup & telemetry cache
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: data/state.db
+          key: ai-daily-state-${{ github.run_id }}
+          restore-keys: |
+            ai-daily-state-
+
+      - name: Stage 1 — Prepare fixed draft & check receipts
+        id: prepare
+        if: ${{ steps.check_secrets.outputs.ready == 'true' }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          NOTIFY_CHANNEL: ${{ secrets.NOTIFY_CHANNEL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+          FEISHU_RECEIVE_ID_TYPE: ${{ secrets.FEISHU_RECEIVE_ID_TYPE }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARGS="--stage prepare --state-dir .delivery-state --skip-if-today-exists --json-summary /tmp/prepare_summary.json"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="--dry-run --json-summary /tmp/prepare_summary.json"
+          elif [ "${{ inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+
+          # 策略 B：10:23 主跑不主动降级（若主备模型全挂则报错交由 10:47 重试完整 LLM）；
+          # 10:47 兜底、外部触发与默认手动触发允许在全模型故障时发送标明降级的短报。
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "23 2 * * *" ]; then
+            ARGS="$ARGS --no-degrade-on-llm-error"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.allow_degrade }}" = "false" ]; then
+            ARGS="$ARGS --no-degrade-on-llm-error"
+          else
+            ARGS="$ARGS --degrade-on-llm-error"
+          fi
+
+          rc=0
+          python3 -m ai_daily run $ARGS || rc=$?
+
+          python3 - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("/tmp/prepare_summary.json")
+          out_path = os.environ.get("GITHUB_OUTPUT", "")
+          data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+          if out_path:
+              with open(out_path, "a", encoding="utf-8") as fh:
+                  fh.write(f"already_sent={'true' if data.get('already_sent') else 'false'}\n")
+                  fh.write(f"reused_draft={'true' if data.get('reused_draft') else 'false'}\n")
+                  fh.write(f"delivery_status={data.get('delivery_status', 'error')}\n")
+                  fh.write(f"run_date={data.get('run_date', '')}\n")
+          PY
+          exit $rc
+
+      - name: Persist pending draft or failure state to delivery-state branch
+        id: push_draft
+        if: ${{ always() && steps.check_secrets.outputs.ready == 'true' && inputs.dry_run != true && steps.prepare.outputs.already_sent != 'true' }}
+        run: |
+          DATE_TAG="${{ steps.prepare.outputs.run_date }}"
+          [ -n "$DATE_TAG" ] || DATE_TAG="$(date +%Y-%m-%d)"
+          STATUS_TAG="${{ steps.prepare.outputs.delivery_status }}"
+          bash scripts/sync_state_branch.sh push delivery-state .delivery-state "chore(state): prepare ${DATE_TAG} (${STATUS_TAG:-pending}) [skip ci]"
+
+      - name: Stage 2 — Deliver fixed draft to unconfirmed channels
+        id: deliver
+        if: ${{ steps.check_secrets.outputs.ready == 'true' && inputs.dry_run != true && steps.prepare.outcome == 'success' && steps.prepare.outputs.already_sent != 'true' && steps.push_draft.outcome == 'success' }}
+        env:
+          NOTIFY_CHANNEL: ${{ secrets.NOTIFY_CHANNEL }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+          FEISHU_RECEIVE_ID_TYPE: ${{ secrets.FEISHU_RECEIVE_ID_TYPE }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+        run: |
+          ARGS="--stage deliver --state-dir .delivery-state --json-summary /tmp/deliver_summary.json"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+
+          rc=0
+          python3 -m ai_daily run $ARGS || rc=$?
+
+          python3 - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("/tmp/deliver_summary.json")
+          out_path = os.environ.get("GITHUB_OUTPUT", "")
+          data = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+          if out_path:
+              with open(out_path, "a", encoding="utf-8") as fh:
+                  fh.write(f"delivery_status={data.get('delivery_status', 'failed')}\n")
+                  fh.write(f"model_used={data.get('model_used', '')}\n")
+                  fh.write(f"degraded={'true' if data.get('degraded') else 'false'}\n")
+                  fh.write(f"selected_count={data.get('selected_count', 0)}\n")
+          PY
+          exit $rc
+
+      - name: Persist delivery receipt to delivery-state branch
+        id: push_receipt
+        if: ${{ always() && steps.check_secrets.outputs.ready == 'true' && inputs.dry_run != true && steps.prepare.outcome == 'success' && steps.prepare.outputs.already_sent != 'true' && steps.push_draft.outcome == 'success' }}
+        run: |
+          DATE_TAG="${{ steps.prepare.outputs.run_date }}"
+          [ -n "$DATE_TAG" ] || DATE_TAG="$(date +%Y-%m-%d)"
+          STATUS_TAG="${{ steps.deliver.outputs.delivery_status }}"
+          bash scripts/sync_state_branch.sh push delivery-state .delivery-state "chore(state): receipt ${DATE_TAG} (${STATUS_TAG:-unknown}) [skip ci]"
+
+      - name: Commit confirmed archive & 7-day history to main
+        id: commit_archive
+        if: ${{ steps.check_secrets.outputs.ready == 'true' && inputs.dry_run != true && steps.deliver.outcome == 'success' }}
+        run: |
+          git config user.name "ai-daily-bot"
+          git config user.email "ai-daily-bot@users.noreply.github.com"
+          for p in output data/sent_history.json; do
+            if [ -e "$p" ]; then
+              git add "$p"
+            fi
+          done
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(daily): archive confirmed digest $(date +%Y-%m-%d) [skip ci]"
+            for attempt in 1 2 3; do
+              if git push origin HEAD:main; then
+                exit 0
+              fi
+              git pull --rebase --autostash origin main || true
+              sleep $((attempt * 2))
+            done
+            exit 1
+          fi
+
+      - name: Report external dead-man's-switch monitor (after receipt persisted)
+        if: ${{ always() && steps.check_secrets.outputs.ready == 'true' && inputs.dry_run != true && steps.prepare.outputs.already_sent != 'true' }}
+        env:
+          HEALTHCHECK_PING_URL: ${{ secrets.HEALTHCHECK_PING_URL }}
+        run: |
+          if [ "${{ steps.deliver.outcome }}" = "success" ] && [ "${{ steps.push_receipt.outcome }}" = "success" ]; then
+            MSG="date=${{ steps.prepare.outputs.run_date }} status=sent model=${{ steps.deliver.outputs.model_used }} items=${{ steps.deliver.outputs.selected_count }} degraded=${{ steps.deliver.outputs.degraded }} trigger=${{ github.event_name }}"
+            python3 -m ai_daily ping-monitor --status ok --message "$MSG" || true
+          else
+            # 10:23 主跑普通失败交给 10:47 兜底（若 10:47 被丢弃则由外部监控 11:15 截止窗口告警）；
+            # 若已到兜底轮/手动触发，或已发出但回执写失败/结果未知，立刻上报 /fail 触发告警。
+            IS_PRIMARY_CRON="false"
+            if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "23 2 * * *" ]; then
+              IS_PRIMARY_CRON="true"
+            fi
+            SHOULD_FAIL_PING="true"
+            if [ "$IS_PRIMARY_CRON" = "true" ] && [ "${{ steps.deliver.outcome }}" != "success" ] && [ "${{ steps.deliver.outputs.delivery_status }}" != "unknown" ]; then
+              SHOULD_FAIL_PING="false"
+            fi
+            if [ "$SHOULD_FAIL_PING" = "true" ]; then
+              MSG="date=${{ steps.prepare.outputs.run_date }} prepare=${{ steps.prepare.outcome }} deliver=${{ steps.deliver.outcome }} receipt_push=${{ steps.push_receipt.outcome }} status=${{ steps.deliver.outputs.delivery_status || steps.prepare.outputs.delivery_status }}"
+              python3 -m ai_daily ping-monitor --status fail --message "$MSG" || true
+            fi
+          fi
+
+      - name: Write workflow summary
+        if: ${{ always() && steps.check_secrets.outputs.ready == 'true' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if not summary_file:
+              raise SystemExit(0)
+          p_prep = pathlib.Path("/tmp/prepare_summary.json")
+          p_del = pathlib.Path("/tmp/deliver_summary.json")
+          prep = json.loads(p_prep.read_text(encoding="utf-8")) if p_prep.is_file() else {}
+          deliv = json.loads(p_del.read_text(encoding="utf-8")) if p_del.is_file() else {}
+          active = deliv or prep
+          lines = [
+              f"### AI 前沿日报执行摘要 ({active.get('run_date', 'N/A')})",
+              "",
+              f"- **触发方式**: `{os.environ.get('GITHUB_EVENT_NAME', '')}`",
+              f"- **交付状态**: `{active.get('delivery_status', 'unknown')}` | **已跳过(已送达)**: `{prep.get('already_sent', False)}` | **复用待发稿**: `{prep.get('reused_draft', False)}`",
+              f"- **使用模型**: `{active.get('model_used') or 'N/A'}` | **降级短报**: `{active.get('degraded', False)}`",
+              f"- **精选条数**: `{active.get('selected_count', 0)}` | **信源成功**: `{active.get('sources_ok', 0)}/{active.get('sources_total', 0)}`",
+              f"- **渠道回执**: `{json.dumps(active.get('channel_statuses') or {}, ensure_ascii=False)}`",
+          ]
+          if active.get("push_error"):
+              lines.append(f"- **异常说明**: {active['push_error']}")
+          with open(summary_file, "a", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+          PY
